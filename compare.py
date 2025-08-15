@@ -4,36 +4,29 @@ import argparse
 from pathlib import Path
 
 def load_summary(path):
-    data = {}
-    for line in Path(path).open():
-        line = line.strip()
+    """Load benchmark data from the first line of a JSONL file."""
+    with Path(path).open() as f:
+        line = f.readline().strip()
         if not line:
-            continue
-        obj = json.loads(line)
+            return {}
         
-        # Group metrics by benchmark name (extracted from key prefixes)
+        obj = json.loads(line)
+        data = {}
+        
+        # Group metrics by benchmark name
         for key, value in obj.items():
             if "/" in key:
-                # Extract benchmark name from key like "cpu-memory-bw-latency/return_code"
-                benchmark_name = key.split("/")[0]
-                metric_name = key.split("/", 1)[1]  # Get everything after first "/"
+                benchmark_name, metric_name = key.split("/", 1)
                 
-                # Skip return codes and correctness metrics as before
-                if "return_code" in metric_name or "correctness" in metric_name or "monitor" in metric_name:
+                # Skip unwanted benchmark types
+                if any(skip in benchmark_name for skip in ["correctness", "monitor", "return_code"]):
                     continue
                 
                 if benchmark_name not in data:
                     data[benchmark_name] = {}
-                
                 data[benchmark_name][metric_name] = value
-            else:
-                # Handle keys without "/" separator (like "node")
-                if key not in ("return_code", "return_code_list") and "correctness" not in key and "monitor" not in key:
-                    if "misc" not in data:
-                        data["misc"] = {}
-                    data["misc"][key] = value
-    
-    return data
+        
+        return data
 
 def main():
     parser = argparse.ArgumentParser(
@@ -42,65 +35,77 @@ def main():
     parser.add_argument("file2", help="second summary JSONL")
     args = parser.parse_args()
 
-    s1 = load_summary(args.file1)
-    s2 = load_summary(args.file2)
+    data1 = load_summary(args.file1)
+    data2 = load_summary(args.file2)
 
-    only1 = set(s1) - set(s2)
-    only2 = set(s2) - set(s1)
-    missing = sorted(only1 | only2)
-
-    # intersect and filter out non-string keys and any with "correctness"
-    common = sorted(set(s1) & set(s2))
+    # Find benchmarks that exist in only one file
+    only1 = set(data1) - set(data2)
+    only2 = set(data2) - set(data1)
+    common = set(data1) & set(data2)
+    
     threshold = 0.05
 
-    for bench in common:
-         a = s1[bench]
-         b = s2[bench]
-         diffs = []
-         keys = set(a) | set(b)
-         for k in sorted(keys):
-             va = a.get(k)
-             vb = b.get(k)
-             # skip if missing in either file
-             if va is None or vb is None:
-                 continue
-             # normalize to numeric values
-             if isinstance(va, list) and va:
-                 v1 = va[0]
-             elif isinstance(va, (int, float)):
-                 v1 = va
-             else:
-                 continue
-             if isinstance(vb, list) and vb:
-                 v2 = vb[0]
-             elif isinstance(vb, (int, float)):
-                 v2 = vb
-             else:
-                 continue
-             # skip identical
-             if v1 == v2:
-                 continue
-             # compute relative change: file2 over file1
-             try:
-                 pct = (v2 - v1) / v1
-             except (ZeroDivisionError, TypeError):
-                 continue
-             if abs(pct) > threshold:
-                 diffs.append((k, va, vb, pct))
-         if diffs:
-             print(f"{bench}:")
-             for k, va, vb, pct in diffs:
-                 # show positive or negative change
-                 print(f"  - {k}: {pct:+.1%}")
-                 print(f"      {args.file1}: {va}")
-                 print(f"      {args.file2}: {vb}")
+    # Compare common benchmarks
+    for benchmark in sorted(common):
+        metrics1 = data1[benchmark]
+        metrics2 = data2[benchmark]
+        
+        # Check for metric differences
+        metrics_only1 = set(metrics1) - set(metrics2)
+        metrics_only2 = set(metrics2) - set(metrics1)
+        
+        if metrics_only1 or metrics_only2:
+            print(f"{benchmark} - Missing metrics:")
+            if metrics_only1:
+                print(f"  Only in {args.file1}:")
+                for metric in sorted(metrics_only1):
+                    print(f"    - {metric}")
+            if metrics_only2:
+                print(f"  Only in {args.file2}:")
+                for metric in sorted(metrics_only2):
+                    print(f"    - {metric}")
+            print()
+        
+        # Check for value differences in common metrics
+        common_metrics = set(metrics1) & set(metrics2)
+        diffs = []
+        
+        for metric in sorted(common_metrics):
+            val1, val2 = metrics1[metric], metrics2[metric]
+            
+            # Skip non-numeric comparisons
+            if not isinstance(val1, (int, float)) or not isinstance(val2, (int, float)):
+                continue
+                
+            if val1 == val2:
+                continue
+                
+            try:
+                pct = (val2 - val1) / val1
+                if abs(pct) > threshold:
+                    diffs.append((metric, val1, val2, pct))
+            except ZeroDivisionError:
+                continue
+        
+        if diffs:
+            print(f"{benchmark} - Value differences:")
+            for metric, val1, val2, pct in diffs:
+                print(f"  - {metric}: {pct:+.1%}")
+                print(f"      {args.file1}: {val1}")
+                print(f"      {args.file2}: {val2}")
+            print()
 
-    if missing:
-        print(f"\nBenchmarks only in one file:")
-        for bench in sorted(only1):
-            print(f"  Only in {args.file1}: {bench}")
-        for bench in sorted(only2):
-            print(f"  Only in {args.file2}: {bench}")
+    # Print missing benchmarks
+    if only1 or only2:
+        print("Benchmarks only in one file:")
+        if only1:
+            print(f"  Only in {args.file1}:")
+            for benchmark in sorted(only1):
+                print(f"    - {benchmark}")
+        if only2:
+            print(f"  Only in {args.file2}:")
+            for benchmark in sorted(only2):
+                print(f"    - {benchmark}")
 
 if __name__ == "__main__":
     main()

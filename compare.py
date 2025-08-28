@@ -97,7 +97,7 @@ def main():
 
     # Print missing benchmarks
     if only1 or only2:
-        print("Benchmarks only in one file:")
+        print("Missing Benchmarks:")
         if only1:
             print(f"  Only in {args.file1}:")
             for benchmark in sorted(only1):

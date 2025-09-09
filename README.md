@@ -60,3 +60,30 @@ Benchmarks with non-zero return codes:
   • cudnn-function/return_code:124
   • gemm-flops/return_code:124
 ```
+### 3. `check_benchmarks.py` - Verify Enabled Benchmarks in Results
+
+Checks that every benchmark listed under `superbench.enable` in a SuperBench YAML config appears in a JSONL results file.
+
+**Usage:**
+```bash
+python check_benchmarks.py <config.yaml> <results-summary.jsonl>
+```
+
+**Example:**
+```bash
+python check_benchmarks.py gb200.yaml results-summary.jsonl
+```
+
+**Output:**
+- Prints each enabled benchmark with `OK` if any key in the JSONL starts with `<benchmark>/`, or `MISSING` otherwise  
+- Exits with status `0` if all are present, or `1` if any benchmarks are missing
+
+**Sample Output:**
+```
+kernel-launch                       : OK
+gemm-flops                          : OK
+…
+computation-communication-overlap   : MISSING
+…
+All enabled benchmarks are present.  # or lists
+```

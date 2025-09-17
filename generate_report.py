@@ -8,6 +8,7 @@ Usage:
 """
 import argparse
 import sys
+import json
 from pathlib import Path
 import html
 import plotly.graph_objects as go
@@ -25,6 +26,11 @@ def parse_file(filepath: Path):
     Parse a markdown-style results file into {section: {metric: mean_value}}.
     Preserves insertion order of sections and metrics.
     """
+  # Notes:
+  # - The parser is intentionally permissive because different summary files
+  #   may format tables differently (e.g., extra pipes, missing headers).
+  # - We look for common 'mean' column labels and fall back to simple
+  #   two-column rows when possible. Non-numeric cells are ignored.
     data = {}
     current = None
     if not filepath.exists():
@@ -96,13 +102,9 @@ def parse_file(filepath: Path):
 def group_key(metric: str) -> str:
     """
     Group by the leading token of the metric, stripping trailing sizes/variants.
-    Examples:
-      'gpu-stream:perf' -> 'gpu-stream'
-      'model-benchmarks:gpt@small-fp8' -> 'model-benchmarks'
-      'gemm-flops' -> 'gemm'
-      'nvbandwidth 128' -> 'nvbandwidth'
-      'nvbandwidth(128MB)' -> 'nvbandwidth'
     """
+    # Normalize input to a string and trim whitespace.
+    # We aim to extract a stable "group" prefix for related metrics.
     m = str(metric).strip()
     # quick explicit prefixes mapping (optional) - keep small if used
     PREFIX_MAP = {
@@ -110,7 +112,9 @@ def group_key(metric: str) -> str:
     }
     if m in PREFIX_MAP:
         return PREFIX_MAP[m]
-    # capture leading alnum/-,_ sequence (stop at whitespace, parentheses, digits-only suffix, or other punctuation)
+    # Capture a leading token that starts with a letter and continues with
+    # letters, digits, underscores or dashes. This catches common metric
+    # identifiers like 'gpu-stream', 'nvbandwidth', 'gemm-flops', etc.
     mo = re.match(r'^([A-Za-z][A-Za-z0-9_\-]*)', m)
     if mo:
         return mo.group(1)
@@ -142,6 +146,71 @@ def fmt(v):
         return f"{float(v):,.3f}"
     except Exception:
         return str(v)
+
+
+MAX_WRAP_CHUNKS = 6
+
+def wrap_chunks(s: str, width: int = 40, max_chunks: int = MAX_WRAP_CHUNKS):
+    """
+    Break a long string into a list of chunk strings suitable for putting into
+    `customdata` so `hovertemplate` can compose them with `<br>` between chunks.
+
+    Behaviour summary:
+    - Prefer splitting on whitespace to preserve whole words when possible.
+    - If a single word/token exceeds `width`, break that token into
+      width-sized slices so extremely long identifiers are still wrapped.
+    - Always return exactly `max_chunks` entries (pad with empty strings)
+      so `customdata` rows have a stable shape.
+    """
+    if s is None:
+        return [""] * max_chunks
+    text = str(s)
+    parts = []
+    cur = ""
+    # Split while preserving whitespace groups so we can rebuild lines
+    for token in re.split(r'(\s+)', text):
+        if not token:
+            continue
+        tok = token.strip()
+        if not tok:
+            continue
+        # If token itself is longer than width, flush any current buffer
+        # then slice the long token into width-sized pieces.
+        if len(tok) > width:
+            if cur:
+                parts.append(cur.strip())
+                cur = ""
+            t = tok
+            for i in range(0, len(t), width):
+                parts.append(t[i:i+width])
+            continue
+        # Otherwise attempt to append to the current line; if it would exceed
+        # width, push current and start a new one.
+        if len((cur + ' ' + tok).strip()) > width and cur:
+            parts.append(cur.strip())
+            cur = tok
+        else:
+            cur = (cur + ' ' + tok).strip()
+    if cur:
+        parts.append(cur.strip())
+    # Escape HTML and normalize to fixed length
+    parts = [html.escape(p) for p in parts][:max_chunks]
+    if len(parts) < max_chunks:
+        parts.extend([""] * (max_chunks - len(parts)))
+    return parts
+
+
+def wrap_text_single(s: str, width: int = 40, max_chunks: int = MAX_WRAP_CHUNKS) -> str:
+    """
+    Return a single HTML string with <br> between non-empty chunks.
+    This avoids emitting empty lines when fewer chunks are used.
+    """
+    parts = wrap_chunks(s, width=width, max_chunks=max_chunks)
+    # Remove empty parts and join with <br> so the hover shows no blank lines.
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    return "<br>".join(parts)
 
 def build_table_html(metrics, baseline_vals, compare_vals, percent_diffs):
     """
@@ -176,8 +245,11 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             sections.append(s)
 
     html_snippets = []
+    plot_pairs = []
+    id_counter = 0
+
     for sec in sections:
-        # Determine metric order: baseline metrics in order, then compare-only metrics
+        # Determine metric order: baseline metrics then compare-only
         baseline_metrics = [m for m in list(baseline_data.get(sec, {}).keys()) if not should_ignore_metric(m)]
         compare_metrics = [m for m in list(compare_data.get(sec, {}).keys()) if not should_ignore_metric(m)]
         metrics = []
@@ -190,7 +262,7 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
         if not metrics:
             continue
 
-        # Group metrics by group_key preserving order (first occurrence)
+        # Group metrics by group_key preserving order
         groups = []
         group_map = {}
         for m in metrics:
@@ -200,16 +272,15 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
                 groups.append(g)
             group_map[g].append(m)
 
-        # Render each group: optional HTML table + charts
         html_snippets.append(f"<h2>{html.escape(sec)}</h2>")
         for g in groups:
             group_metrics = [m for m in group_map[g] if not should_ignore_metric(m)]
             if not group_metrics:
                 continue
 
-            # prepare values
             baseline_vals = [baseline_data.get(sec, {}).get(m) for m in group_metrics]
             compare_vals = [compare_data.get(sec, {}).get(m) for m in group_metrics]
+
             percent_diffs = []
             for b, c in zip(baseline_vals, compare_vals):
                 if b is None or c is None:
@@ -220,40 +291,166 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
                     except Exception:
                         percent_diffs.append(None)
 
-            # Small table (optional)
             html_snippets.append(f"<h3>Group: {html.escape(g)}</h3>")
             if include_tables:
                 html_snippets.append(build_table_html(group_metrics, baseline_vals, compare_vals, percent_diffs))
 
             # Charts
-            fig_bar = go.Figure()
-            fig_bar.add_trace(go.Bar(x=group_metrics, y=baseline_vals, name=label_baseline))
-            fig_bar.add_trace(go.Bar(x=group_metrics, y=compare_vals, name=label_compare))
-            fig_bar.update_layout(
-                title=f"[{sec}] {g} - Metric Comparison",
-                xaxis_title="Metric",
-                yaxis_title="Mean Value",
-                barmode="group",
-                template="plotly_white",
-                height=420
-            )
+            id_counter += 1
+            bar_id = f"plot_bar_{id_counter}"
+            diff_id = f"plot_diff_{id_counter}"
 
+            # prepare wrapped hover text and customdata rows [report_name, wrapped_html]
+            wrapped_single = [wrap_text_single(m, width=40, max_chunks=MAX_WRAP_CHUNKS) for m in group_metrics]
+            custom_rows_baseline = [[label_baseline, ws] for ws in wrapped_single]
+            custom_rows_compare = [[label_compare, ws] for ws in wrapped_single]
+
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(x=group_metrics, y=baseline_vals, name=label_baseline,
+                                     customdata=custom_rows_baseline,
+                                     hovertemplate="%{customdata[0]}<br>%{customdata[1]}<br><b>%{y}</b><extra></extra>"))
+            fig_bar.add_trace(go.Bar(x=group_metrics, y=compare_vals, name=label_compare,
+                                     customdata=custom_rows_compare,
+                                     hovertemplate="%{customdata[0]}<br>%{customdata[1]}<br><b>%{y}</b><extra></extra>"))
+            fig_bar.update_layout(title=f"[{sec}] {g} - Metric Comparison",
+                                  xaxis_title="Metric", yaxis_title="Mean Value",
+                                  barmode="group", template="plotly_white",
+                                  height=420, hovermode="x unified")
+            fig_bar.update_traces(hoverlabel=dict(align='left'))
+
+            diff_custom = [[f"% diff ({label_compare} vs {label_baseline})", ws] for ws in wrapped_single]
             fig_diff = go.Figure()
             fig_diff.add_trace(go.Scatter(x=group_metrics, y=percent_diffs, mode="lines+markers",
-                                          name=f"% diff ({label_compare} vs {label_baseline})",
-                                          line=dict(color="orange")))
+                                           name=f"% diff ({label_compare} vs {label_baseline})",
+                                           line=dict(color="orange"),
+                                           customdata=diff_custom,
+                                           hovertemplate="%{customdata[0]}<br>%{customdata[1]}<br><b>%{y:.2f}%</b><extra></extra>"))
             fig_diff.add_shape(type='line', x0=-0.5, x1=len(group_metrics)-0.5, y0=0, y1=0,
                                line=dict(color='gray', dash='dash'))
-            fig_diff.update_layout(
-                title=f"[{sec}] {g} - Percent Difference ({label_compare} vs {label_baseline})",
-                xaxis_title="Metric",
-                yaxis_title="Percent Difference (%)",
-                template="plotly_white",
-                height=380
-            )
+            fig_diff.update_layout(title=f"[{sec}] {g} - Percent Difference ({label_compare} vs {label_baseline})",
+                                   xaxis_title="Metric", yaxis_title="Percent Difference (%)",
+                                   template="plotly_white", height=380, hovermode="x unified")
+            fig_diff.update_traces(hoverlabel=dict(align='left'))
 
-            html_snippets.append(pio.to_html(fig_bar, full_html=False, include_plotlyjs=False))
-            html_snippets.append(pio.to_html(fig_diff, full_html=False, include_plotlyjs=False))
+            # Export HTML fragments and register pair for JS
+            bar_html = fig_bar.to_html(full_html=False, include_plotlyjs=False, div_id=bar_id)
+            diff_html = fig_diff.to_html(full_html=False, include_plotlyjs=False, div_id=diff_id)
+            html_snippets.append(bar_html)
+            html_snippets.append(diff_html)
+
+            plot_pairs.append({
+                "bar": bar_id,
+                "diff": diff_id,
+                "x": group_metrics,
+                "ys": [baseline_vals, compare_vals],
+                "diffs": percent_diffs
+            })
+
+    # Build JS that syncs zoom/pan and triggers y-autorange on visible data
+    js_sync = """
+<script>
+document.addEventListener('DOMContentLoaded', function(){
+  const pairs = REPLACE_PAIRS_JSON;
+
+  function extractXRange(relayoutData){
+    if(!relayoutData) return null;
+    if(relayoutData['xaxis.range']) return relayoutData['xaxis.range'];
+    let x0 = null, x1 = null;
+    for(const k in relayoutData){
+      if(k === '_sync_source') continue;
+      const m = k.match(/^xaxis\.range\[(\d)\]$/);
+      if(m){
+        if(m[1]==='0') x0 = relayoutData[k];
+        if(m[1]==='1') x1 = relayoutData[k];
+      }
+    }
+    if(x0 !== null && x1 !== null) return [x0, x1];
+    return null;
+  }
+
+  function visibleIndexRangeFromX(xr, xArray){
+    if(!xr) return null;
+    let a = xr[0], b = xr[1];
+    if(typeof a === 'string' && typeof b === 'string' && xArray.indexOf(a) !== -1 && xArray.indexOf(b) !== -1){
+      let i0 = xArray.indexOf(a), i1 = xArray.indexOf(b);
+      if(i0 > i1){ let t = i0; i0 = i1; i1 = t; }
+      return {start: i0, end: i1};
+    }
+    let na = parseFloat(a), nb = parseFloat(b);
+    if(!isNaN(na) && !isNaN(nb)){
+      let i0 = Math.max(0, Math.floor(Math.min(na, nb)));
+      let i1 = Math.min(xArray.length - 1, Math.ceil(Math.max(na, nb)));
+      return {start: i0, end: i1};
+    }
+    return null;
+  }
+
+  function computeRangeForValues(arrays, idxRange){
+    if(!idxRange) return null;
+    let ymin = Number.POSITIVE_INFINITY, ymax = Number.NEGATIVE_INFINITY;
+    let found = false;
+    for(let a=0; a<arrays.length; a++){
+      const arr = arrays[a] || [];
+      for(let i=idxRange.start; i<=idxRange.end && i < arr.length; i++){
+        const v = arr[i];
+        if(v === null || v === undefined) continue;
+        const num = Number(v);
+        if(Number.isFinite(num)){
+          found = true;
+          if(num < ymin) ymin = num;
+          if(num > ymax) ymax = num;
+        }
+      }
+    }
+    if(!found) return null;
+    if(ymin === ymax){
+      if(ymin === 0){ ymin = -1; ymax = 1; }
+      else { const pad = Math.abs(ymin) * 0.06; ymin -= pad; ymax += pad; }
+    } else { const span = ymax - ymin; const pad = span * 0.06; ymin -= pad; ymax += pad; }
+    return [ymin, ymax];
+  }
+
+  pairs.forEach(function(pair){
+    const barDiv = document.getElementById(pair.bar);
+    const diffDiv = document.getElementById(pair.diff);
+    const xArray = pair.x || [];
+    const ys = pair.ys || [[],[]];
+    const diffs = pair.diffs || [];
+
+    function onRelayout(sourceId, targetId, eventData){
+      if(eventData && eventData['_sync_source']) return;
+      const xr = extractXRange(eventData);
+      const idxRange = visibleIndexRangeFromX(xr, xArray);
+      if(idxRange){
+        const barRange = computeRangeForValues(ys, idxRange);
+        const diffRange = computeRangeForValues([diffs], idxRange);
+        try{
+          let payload = {'xaxis.range': xr, '_sync_source': sourceId};
+          if(barRange && targetId.startsWith('plot_bar_')) payload['yaxis.range'] = barRange;
+          Plotly.relayout(targetId, payload);
+        }catch(e){}
+        try{
+          if(sourceId === pair.bar && diffDiv){
+            if(diffRange) Plotly.relayout(pair.diff, {'yaxis.range': diffRange, '_sync_source': sourceId});
+            else Plotly.relayout(pair.diff, {'yaxis.autorange': true, '_sync_source': sourceId});
+          }
+          if(sourceId === pair.diff && barDiv){
+            if(barRange) Plotly.relayout(pair.bar, {'yaxis.range': barRange, '_sync_source': sourceId});
+            else Plotly.relayout(pair.bar, {'yaxis.autorange': true, '_sync_source': sourceId});
+          }
+        }catch(e){}
+      } else {
+        try{ Plotly.relayout(targetId, {'yaxis.autorange': true, '_sync_source': sourceId}); }catch(e){}
+      }
+    }
+
+    if(barDiv && barDiv.on){ barDiv.on('plotly_relayout', function(eventData){ onRelayout(pair.bar, pair.diff, eventData); }); }
+    if(diffDiv && diffDiv.on){ diffDiv.on('plotly_relayout', function(eventData){ onRelayout(pair.diff, pair.bar, eventData); }); }
+  });
+});
+</script>
+"""
+    js_sync = js_sync.replace("REPLACE_PAIRS_JSON", json.dumps(plot_pairs))
 
     table_note = " (tables included)" if include_tables else " (charts only)"
     ignore_note = f" (ignored: {', '.join(IGNORE_TOKENS)})" if IGNORE_TOKENS else ""
@@ -272,6 +469,7 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
   <h1>Plotly Metrics Comparison Report{table_note}{ignore_note}</h1>
   <p><strong>Baseline:</strong> {html.escape(label_baseline)}<br/><strong>Compare:</strong> {html.escape(label_compare)}</p>
   {"".join(f'<div class="plot-container">{plot}</div>' for plot in html_snippets)}
+  {js_sync}
 </body>
 </html>"""
 

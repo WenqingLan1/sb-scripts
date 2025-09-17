@@ -297,6 +297,17 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
 
             # Charts
             id_counter += 1
+            # Reserve a fixed plotting area height and separate bottom margin
+            # to prevent long metric names (x-axis labels) from stealing plot
+            # vertical space. Values lowered to reduce overall chart height
+            # while keeping label area readable on typical monitors.
+            plot_area_height = 360
+            bottom_margin_for_labels = 120
+            height_bar = plot_area_height + bottom_margin_for_labels
+
+            plot_area_height_diff = 260
+            bottom_margin_for_labels_diff = 100
+            height_diff = plot_area_height_diff + bottom_margin_for_labels_diff
             bar_id = f"plot_bar_{id_counter}"
             diff_id = f"plot_diff_{id_counter}"
 
@@ -312,10 +323,20 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             fig_bar.add_trace(go.Bar(x=group_metrics, y=compare_vals, name=label_compare,
                                      customdata=custom_rows_compare,
                                      hovertemplate="%{customdata[0]}<br>%{customdata[1]}<br><b>%{y}</b><extra></extra>"))
-            fig_bar.update_layout(title=f"[{sec}] {g} - Metric Comparison",
-                                  xaxis_title="Metric", yaxis_title="Mean Value",
-                                  barmode="group", template="plotly_white",
-                                  height=420, hovermode="x unified")
+            # Increase chart height for better y-axis spacing/readability.
+            # Place the legend horizontally above the plot so long file
+            # path labels do not consume horizontal space on the right.
+            fig_bar.update_layout(
+                title=f"[{sec}] {g} - Metric Comparison",
+                xaxis_title="", yaxis_title="Mean Value",
+                barmode="group", template="plotly_white",
+                height=height_bar, hovermode="x unified",
+                legend=dict(orientation='h', y=1.08, x=0.01, xanchor='left'),
+                margin=dict(t=120, b=bottom_margin_for_labels)
+            )
+            # Keep x-axis label area stable: rotate ticks and prevent pan/zoom changing
+            # the x-axis label layout (fixedrange keeps labels readable during pan).
+            fig_bar.update_xaxes(tickangle=45, automargin=False, fixedrange=False, title_standoff=40)
             fig_bar.update_traces(hoverlabel=dict(align='left'))
 
             diff_custom = [[f"% diff ({label_compare} vs {label_baseline})", ws] for ws in wrapped_single]
@@ -327,9 +348,16 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
                                            hovertemplate="%{customdata[0]}<br>%{customdata[1]}<br><b>%{y:.2f}%</b><extra></extra>"))
             fig_diff.add_shape(type='line', x0=-0.5, x1=len(group_metrics)-0.5, y0=0, y1=0,
                                line=dict(color='gray', dash='dash'))
-            fig_diff.update_layout(title=f"[{sec}] {g} - Percent Difference ({label_compare} vs {label_baseline})",
-                                   xaxis_title="Metric", yaxis_title="Percent Difference (%)",
-                                   template="plotly_white", height=380, hovermode="x unified")
+            # Slightly larger diff plot to match bar chart vertical space.
+            # Use a top-positioned horizontal legend to avoid horizontal clutter.
+            fig_diff.update_layout(
+                title=f"[{sec}] {g} - Percent Difference ({label_compare} vs {label_baseline})",
+                xaxis_title="", yaxis_title="Percent Difference (%)",
+                template="plotly_white", height=height_diff, hovermode="x unified",
+                legend=dict(orientation='h', y=1.08, x=0.01, xanchor='left'),
+                margin=dict(t=120, b=bottom_margin_for_labels_diff)
+            )
+            fig_diff.update_xaxes(tickangle=45, automargin=False, fixedrange=False, title_standoff=36)
             fig_diff.update_traces(hoverlabel=dict(align='left'))
 
             # Export HTML fragments and register pair for JS
@@ -422,23 +450,34 @@ document.addEventListener('DOMContentLoaded', function(){
       const xr = extractXRange(eventData);
       const idxRange = visibleIndexRangeFromX(xr, xArray);
       if(idxRange){
-        const barRange = computeRangeForValues(ys, idxRange);
-        const diffRange = computeRangeForValues([diffs], idxRange);
-        try{
-          let payload = {'xaxis.range': xr, '_sync_source': sourceId};
-          if(barRange && targetId.startsWith('plot_bar_')) payload['yaxis.range'] = barRange;
-          Plotly.relayout(targetId, payload);
-        }catch(e){}
-        try{
-          if(sourceId === pair.bar && diffDiv){
-            if(diffRange) Plotly.relayout(pair.diff, {'yaxis.range': diffRange, '_sync_source': sourceId});
-            else Plotly.relayout(pair.diff, {'yaxis.autorange': true, '_sync_source': sourceId});
-          }
-          if(sourceId === pair.diff && barDiv){
-            if(barRange) Plotly.relayout(pair.bar, {'yaxis.range': barRange, '_sync_source': sourceId});
-            else Plotly.relayout(pair.bar, {'yaxis.autorange': true, '_sync_source': sourceId});
-          }
-        }catch(e){}
+                // Compute only the percent-diff range; for bar charts prefer Plotly's
+                // built-in autorange so axis ticks are nicely rounded and match the
+                // default behaviour seen in the older notebook.
+                const diffRange = computeRangeForValues([diffs], idxRange);
+                try{
+                    let payload = {'xaxis.range': xr, '_sync_source': sourceId};
+                    if(targetId.startsWith('plot_diff_')){
+                        if(diffRange) payload['yaxis.range'] = diffRange;
+                        else payload['yaxis.autorange'] = true;
+                    } else {
+                        // For bar charts, ask Plotly to autorange (nicer tick placement).
+                        payload['yaxis.autorange'] = true;
+                    }
+                    Plotly.relayout(targetId, payload);
+                }catch(e){}
+                try{
+                    if(sourceId === pair.bar && diffDiv){
+                        if(diffRange) Plotly.relayout(pair.diff, {'yaxis.range': diffRange, '_sync_source': sourceId});
+                        else Plotly.relayout(pair.diff, {'yaxis.autorange': true, '_sync_source': sourceId});
+                    }
+                    if(sourceId === pair.diff && barDiv){
+                        // When the percent-diff trace is the source, let the bar chart
+                        // autorange rather than imposing an explicit numeric range.
+                        try{
+                            Plotly.relayout(pair.bar, {'yaxis.autorange': true, '_sync_source': sourceId});
+                        }catch(e){}
+                    }
+                }catch(e){}
       } else {
         try{ Plotly.relayout(targetId, {'yaxis.autorange': true, '_sync_source': sourceId}); }catch(e){}
       }

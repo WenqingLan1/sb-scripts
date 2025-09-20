@@ -3,6 +3,14 @@
 generate_report.py
 Compare two SuperBench markdown result files and generate an HTML report.
 
+Supports all SuperBench benchmark types including:
+- Model benchmarks (BERT, GPT, LSTM, ResNet, VGG, DenseNet, LLaMA)
+- MICRO1 benchmarks (CUBLAS, cuBLASLt, cuDNN, GEMM-FLOPS including fp64/int8, kernel launch)
+- MICRO2 benchmarks (CPU memory, GPU burn, NCCL bandwidth, matmul, sharding)
+- Memory bandwidth tests (DTOD, GPUMEM, DTOH/HTOD via SM/DMA)
+- GPU-STREAM, nvbandwidth, cpu-stream benchmarks
+- IB, DISK benchmarks
+
 Usage:
     python generate_report.py <baseline.md> <compare.md> [-o report.html] [--include-tables]
 """
@@ -14,12 +22,57 @@ import html
 import plotly.graph_objects as go
 import plotly.io as pio
 import re
+from collections import defaultdict
+from statistics import mean
 
 # Edit this list to ignore metrics containing any of these tokens (case-insensitive).
 # Example: 'correctness' will ignore 'gpu-copy-bw:correctness' and similar metrics.
+# Note: Correctness tests and gpu-burn are typically pass/fail and may not be meaningful for performance comparison.
 IGNORE_TOKENS = [
     "correctness",
+    "gpu-burn",
 ]
+
+def normalize_gpu_metric_name(metric: str) -> str:
+    """
+    Normalize GPU metrics by removing GPU-specific numbering to enable averaging across GPUs.
+    E.g., 'gpu-stream:perf/STREAM_ADD_double_gpu_0_buffer_4294967296_block_1024_bw'
+    becomes 'gpu-stream:perf/STREAM_ADD_double_buffer_4294967296_block_1024_bw'
+    Also handles 'gpu-burn/gpu_0_pass' -> 'gpu-burn/gpu_pass'
+    """
+    # Pattern to match gpu_<number> and remove it, handling both middle and end positions
+    normalized = re.sub(r'_gpu_\d+_', '_', metric)  # Middle: _gpu_0_ -> _
+    normalized = re.sub(r'_gpu_\d+$', '', normalized)  # End: _gpu_0 -> ''
+    normalized = re.sub(r'/gpu_\d+_', '/', normalized)  # After slash: /gpu_0_ -> /
+    normalized = re.sub(r'gpu_\d+_', '', normalized)  # Start: gpu_0_ -> ''
+    return normalized
+
+def aggregate_gpu_metrics(section_data: dict) -> dict:
+    """
+    Aggregate metrics across multiple GPUs by averaging values for metrics that differ only by GPU number.
+    """
+    # Group metrics by their normalized names
+    metric_groups = defaultdict(list)
+    
+    for metric, value in section_data.items():
+        if 'gpu_' in metric and ('gpu-stream' in metric or 'gpu-burn' in metric):
+            normalized_name = normalize_gpu_metric_name(metric)
+            metric_groups[normalized_name].append(value)
+        else:
+            # Keep non-GPU metrics as-is
+            metric_groups[metric].append(value)
+    
+    # Average the grouped metrics
+    aggregated = {}
+    for normalized_metric, values in metric_groups.items():
+        if len(values) > 1:
+            # Multiple values to average
+            aggregated[normalized_metric] = mean(values)
+        else:
+            # Single value, keep as-is
+            aggregated[normalized_metric] = values[0]
+    
+    return aggregated
 
 def parse_file(filepath: Path):
     """
@@ -97,21 +150,49 @@ def parse_file(filepath: Path):
                             data[current][metric] = value
                     except Exception:
                         pass
+    
+    # Aggregate GPU metrics across multiple GPUs
+    for section in data:
+        data[section] = aggregate_gpu_metrics(data[section])
+    
     return data
 
 def group_key(metric: str) -> str:
     """
     Group by the leading token of the metric, stripping trailing sizes/variants.
+    Enhanced to handle new benchmark types including fp64 and int8 GEMM operations.
     """
     # Normalize input to a string and trim whitespace.
     # We aim to extract a stable "group" prefix for related metrics.
     m = str(metric).strip()
-    # quick explicit prefixes mapping (optional) - keep small if used
+    # Enhanced explicit prefixes mapping for better grouping
     PREFIX_MAP = {
-        # 'cublaslt-gemm': 'cublas',  # example if you want custom remaps
+        # Group NCCL bandwidth tests by operation type
+        'nccl-bw:nvlink-allgather': 'nccl-allgather',
+        'nccl-bw:nvlink-alltoall': 'nccl-alltoall', 
+        'nccl-bw:nvlink-broadcast': 'nccl-broadcast',
+        'nccl-bw:nvlink-reduce': 'nccl-reduce',
+        'nccl-bw:nvlink-reducescatter': 'nccl-reducescatter',
+        'nccl-bw:nvlink': 'nccl-allreduce',  # allreduce is the base nvlink test
+        # Group GPU copy bandwidth tests by direction and method
+        'gpu-copy-bw:correctness': 'gpu-copy-correctness',
+        'gpu-copy-bw:perf': 'gpu-copy-perf',
+        # Group GPU stream tests 
+        'gpu-stream:perf': 'gpu-stream',
+        # Group CPU stream tests by socket
+        'cpu-stream:cross-socket0': 'cpu-stream-socket0',
+        'cpu-stream:cross-socket1': 'cpu-stream-socket1',
     }
+    
+    # Check for exact matches first
     if m in PREFIX_MAP:
         return PREFIX_MAP[m]
+    
+    # Check for prefix matches in order of specificity
+    for prefix, group in sorted(PREFIX_MAP.items(), key=len, reverse=True):
+        if m.startswith(prefix):
+            return group
+    
     # Capture a leading token that starts with a letter and continues with
     # letters, digits, underscores or dashes. This catches common metric
     # identifiers like 'gpu-stream', 'nvbandwidth', 'gemm-flops', etc.

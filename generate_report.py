@@ -162,10 +162,19 @@ def group_key(metric: str) -> str:
     """
     Group by the leading token of the metric, stripping trailing sizes/variants.
     Enhanced to handle new benchmark types including fp64 and int8 GEMM operations.
+    Special grouping for model benchmarks: VGG/DenseNet vs other models.
     """
     # Normalize input to a string and trim whitespace.
     # We aim to extract a stable "group" prefix for related metrics.
     m = str(metric).strip()
+    
+    # Special handling for model benchmarks - separate VGG/DenseNet from others
+    m_lower = m.lower()
+    if any(model in m_lower for model in ['vgg', 'densenet']):
+        return 'models-vgg-densenet'
+    elif any(model in m_lower for model in ['bert', 'gpt', 'lstm', 'resnet', 'llama', 'model']):
+        return 'models-other'
+    
     # Enhanced explicit prefixes mapping for better grouping
     PREFIX_MAP = {
         # Group NCCL bandwidth tests by operation type
@@ -383,18 +392,36 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             # to prevent long metric names (x-axis labels) from stealing plot
             # vertical space. Values lowered to reduce overall chart height
             # while keeping label area readable on typical monitors.
+            # Increase bottom margin for groups with many long metric names
+            extra_margin = 40 if len(group_metrics) > 10 else 0
+            
+            # Dynamic font size based on number of metrics to prevent overlap
+            num_metrics = len(group_metrics)
+            if num_metrics <= 5:
+                font_size = 10  # Large font for few items
+            elif num_metrics <= 10:
+                font_size = 9   # Medium font
+            elif num_metrics <= 20:
+                font_size = 8   # Small font
+            elif num_metrics <= 30:
+                font_size = 7   # Smaller font
+            else:
+                font_size = 6   # Very small font for many items
+            
             plot_area_height = 360
-            bottom_margin_for_labels = 120
+            bottom_margin_for_labels = 120 + extra_margin
             height_bar = plot_area_height + bottom_margin_for_labels
 
             plot_area_height_diff = 260
-            bottom_margin_for_labels_diff = 100
+            bottom_margin_for_labels_diff = 100 + extra_margin
             height_diff = plot_area_height_diff + bottom_margin_for_labels_diff
             bar_id = f"plot_bar_{id_counter}"
             diff_id = f"plot_diff_{id_counter}"
 
             # prepare wrapped hover text and customdata rows [report_name, wrapped_html]
             wrapped_single = [wrap_text_single(m, width=50, max_chunks=MAX_WRAP_CHUNKS) for m in group_metrics]
+            # Short labels for x-axis: remove everything before the first '/'
+            display_labels = [m.split("/", 1)[1] if "/" in m else m for m in group_metrics]
             custom_rows_baseline = [[label_baseline, ws] for ws in wrapped_single]
             custom_rows_compare = [[label_compare, ws] for ws in wrapped_single]
 
@@ -419,7 +446,10 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             )
             # Keep x-axis label area stable: rotate ticks and prevent pan/zoom changing
             # the x-axis label layout (fixedrange keeps labels readable during pan).
-            fig_bar.update_xaxes(tickangle=45, automargin=False, fixedrange=False, title_standoff=40)
+            fig_bar.update_xaxes(tickangle=45, automargin=False, fixedrange=False, 
+                                 title_standoff=40, tickmode='array',
+                                 tickvals=group_metrics, ticktext=display_labels,
+                                 tickfont=dict(size=font_size))
             fig_bar.update_traces(hoverlabel=dict(align='left'))
 
             diff_custom = [[f"% diff ({label_compare} vs {label_baseline})", ws] for ws in wrapped_single]
@@ -441,7 +471,10 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
                 legend=dict(orientation='h', y=1.08, x=0.01, xanchor='left'),
                 margin=dict(t=120, b=bottom_margin_for_labels_diff)
             )
-            fig_diff.update_xaxes(tickangle=45, automargin=False, fixedrange=False, title_standoff=36)
+            fig_diff.update_xaxes(tickangle=45, automargin=False, fixedrange=False, 
+                                  title_standoff=36, tickmode='array',
+                                  tickvals=group_metrics, ticktext=display_labels,
+                                  tickfont=dict(size=font_size))
             fig_diff.update_traces(hoverlabel=dict(align='left'))
 
             # Export HTML fragments and register pair for JS

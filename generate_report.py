@@ -31,6 +31,7 @@ from statistics import mean
 IGNORE_TOKENS = [
     "correctness",
     "gpu-burn",
+    "lstm"
 ]
 
 def normalize_gpu_metric_name(metric: str) -> str:
@@ -229,9 +230,9 @@ def fmt(v):
         return str(v)
 
 
-MAX_WRAP_CHUNKS = 6
+MAX_WRAP_CHUNKS = 10
 
-def wrap_chunks(s: str, width: int = 40, max_chunks: int = MAX_WRAP_CHUNKS):
+def wrap_chunks(s: str, width: int = 50, max_chunks: int = MAX_WRAP_CHUNKS):
     """
     Break a long string into a list of chunk strings suitable for putting into
     `customdata` so `hovertemplate` can compose them with `<br>` between chunks.
@@ -281,7 +282,7 @@ def wrap_chunks(s: str, width: int = 40, max_chunks: int = MAX_WRAP_CHUNKS):
     return parts
 
 
-def wrap_text_single(s: str, width: int = 40, max_chunks: int = MAX_WRAP_CHUNKS) -> str:
+def wrap_text_single(s: str, width: int = 50, max_chunks: int = MAX_WRAP_CHUNKS) -> str:
     """
     Return a single HTML string with <br> between non-empty chunks.
     This avoids emitting empty lines when fewer chunks are used.
@@ -393,7 +394,7 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             diff_id = f"plot_diff_{id_counter}"
 
             # prepare wrapped hover text and customdata rows [report_name, wrapped_html]
-            wrapped_single = [wrap_text_single(m, width=40, max_chunks=MAX_WRAP_CHUNKS) for m in group_metrics]
+            wrapped_single = [wrap_text_single(m, width=50, max_chunks=MAX_WRAP_CHUNKS) for m in group_metrics]
             custom_rows_baseline = [[label_baseline, ws] for ws in wrapped_single]
             custom_rows_compare = [[label_compare, ws] for ws in wrapped_single]
 
@@ -407,11 +408,12 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
             # Increase chart height for better y-axis spacing/readability.
             # Place the legend horizontally above the plot so long file
             # path labels do not consume horizontal space on the right.
+            fig_bar.update_traces(hoverlabel=dict(align='left', bgcolor='rgba(255,255,255,0.9)', bordercolor='black'))
             fig_bar.update_layout(
                 title=f"[{sec}] {g} - Metric Comparison",
                 xaxis_title="", yaxis_title="Mean Value",
                 barmode="group", template="plotly_white",
-                height=height_bar, hovermode="x unified",
+                height=height_bar, hovermode="closest",
                 legend=dict(orientation='h', y=1.08, x=0.01, xanchor='left'),
                 margin=dict(t=120, b=bottom_margin_for_labels)
             )
@@ -431,10 +433,11 @@ def build_report(baseline_path, compare_path, out_path, include_tables=False):
                                line=dict(color='gray', dash='dash'))
             # Slightly larger diff plot to match bar chart vertical space.
             # Use a top-positioned horizontal legend to avoid horizontal clutter.
+            fig_diff.update_traces(hoverlabel=dict(align='left', bgcolor='rgba(255,255,255,0.9)', bordercolor='black'))
             fig_diff.update_layout(
                 title=f"[{sec}] {g} - Percent Difference ({label_compare} vs {label_baseline})",
                 xaxis_title="", yaxis_title="Percent Difference (%)",
-                template="plotly_white", height=height_diff, hovermode="x unified",
+                template="plotly_white", height=height_diff, hovermode="closest",
                 legend=dict(orientation='h', y=1.08, x=0.01, xanchor='left'),
                 margin=dict(t=120, b=bottom_margin_for_labels_diff)
             )

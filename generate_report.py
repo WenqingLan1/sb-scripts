@@ -12,7 +12,14 @@ Supports all SuperBench benchmark types including:
 - IB, DISK benchmarks
 
 Usage:
-    python generate_report.py <baseline.md> <compare.md> [-o report.html] [--include-tables]
+    python generate_report.py <baseline.md> <compare.md> [-o report.html] [--include-tables] [--baseline-label LABEL] [--compare-label LABEL]
+    
+Examples:
+    # Basic usage with file paths as labels
+    python generate_report.py baseline.md compare.md -o report.html
+    
+    # Custom labels for cleaner display
+    python generate_report.py gb200.md gb300.md -o report.html --baseline-label "GB200" --compare-label "GB300"
 """
 import argparse
 import sys
@@ -320,11 +327,11 @@ def build_table_html(metrics, baseline_vals, compare_vals, percent_diffs):
     rows.append("</tbody></table>")
     return "\n".join(rows)
 
-def build_report(baseline_path, compare_path, out_path, include_tables=False):
+def build_report(baseline_path, compare_path, out_path, include_tables=False, baseline_label=None, compare_label=None):
     baseline_data = parse_file(Path(baseline_path))
     compare_data = parse_file(Path(compare_path))
-    label_baseline = baseline_path
-    label_compare = compare_path
+    label_baseline = baseline_label if baseline_label else baseline_path
+    label_compare = compare_label if compare_label else compare_path
 
     # Section ordering: baseline sections first, then compare-only sections
     sections = []
@@ -639,12 +646,17 @@ def main():
     p.add_argument("-o", "--output", default="comparison_report.html")
     p.add_argument("--include-tables", action="store_true",
                    help="Include numeric HTML tables for each metric group in the report.")
+    p.add_argument("--baseline-label", help="Custom label for baseline data (default: use file path)")
+    p.add_argument("--compare-label", help="Custom label for compare data (default: use file path)")
     args = p.parse_args()
     if not Path(args.baseline).exists():
         print("Baseline file not found:", args.baseline, file=sys.stderr); sys.exit(2)
     if not Path(args.compare).exists():
         print("Compare file not found:", args.compare, file=sys.stderr); sys.exit(2)
-    build_report(args.baseline, args.compare, args.output, include_tables=args.include_tables)
+    build_report(args.baseline, args.compare, args.output, 
+                include_tables=args.include_tables,
+                baseline_label=args.baseline_label,
+                compare_label=args.compare_label)
 
 if __name__ == "__main__":
     main()
